@@ -120,6 +120,72 @@ class RangeSlider(tk.Canvas):
             )
 
 
+class SeekBar(tk.Canvas):
+    """YouTube처럼 클릭한 위치로 이동하는 단일 progress bar."""
+
+    def __init__(
+        self,
+        parent,
+        command=None,
+        bg: str = "#111827",
+        track_bg: str = "#64748b",
+        active_bg: str = "#0ea5e9",
+        thumb_bg: str = "#f8fafc",
+        **kwargs,
+    ):
+        super().__init__(
+            parent,
+            height=18,
+            bg=bg,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+            **kwargs,
+        )
+        self.command = command
+        self.track_bg = track_bg
+        self.active_bg = active_bg
+        self.thumb_bg = thumb_bg
+        self.max_value = 1
+        self.value = 0
+        self.pad = 6
+
+        self.bind("<Configure>", lambda _event: self._draw())
+        self.bind("<Button-1>", self._on_seek)
+        self.bind("<B1-Motion>", self._on_seek)
+
+    def set_max(self, max_value: int):
+        self.max_value = max(1, max_value)
+        self.value = max(0, min(self.value, self.max_value - 1))
+        self._draw()
+
+    def set_value(self, value: int):
+        self.value = max(0, min(value, self.max_value - 1))
+        self._draw()
+
+    def _on_seek(self, event):
+        width = max(1, self.winfo_width() - self.pad * 2)
+        ratio = max(0.0, min(1.0, (event.x - self.pad) / width))
+        value = int(round(ratio * (self.max_value - 1)))
+        self.set_value(value)
+        if self.command is not None:
+            self.command(value)
+
+    def _draw(self):
+        self.delete("all")
+        width = self.winfo_width()
+        height = self.winfo_height()
+        if width <= 1:
+            return
+
+        y = height // 2
+        ratio = self.value / max(self.max_value - 1, 1)
+        x = int(self.pad + ratio * (width - self.pad * 2))
+        self.create_line(self.pad, y, width - self.pad, y, fill=self.track_bg, width=4)
+        self.create_line(self.pad, y, x, y, fill=self.active_bg, width=4)
+        self.create_oval(x - 5, y - 5, x + 5, y + 5, fill=self.thumb_bg, outline=self.active_bg, width=2)
+
+
 class PoseCoachApp:
     def __init__(self):
         self.root = tk.Tk()
@@ -142,8 +208,11 @@ class PoseCoachApp:
         self.is_running = False
         self.is_recording = False
         self.is_playing_analysis = False
+        self.is_playing_reference_preview = False
+        self.playback_target = "reference"
         self.recorded_video_path: str | None = None
         self.analysis_playback_frames: list[np.ndarray] = []
+        self.analysis_playhead_idx = 0
         self.crop_start: int | None = None
         self.crop_end: int | None = None
         self.user_crop_start_var = tk.IntVar(value=0)
@@ -153,6 +222,7 @@ class PoseCoachApp:
         self.preview_frame: np.ndarray | None = None
         self.display_origin = (0, 0)
         self.display_size = (0, 0)
+        self.video_area_size = (960, 540)
         self.ref_sample_step = 5
         self.ref_playback_fps = 6.0
         self.last_ref_advance = 0.0
@@ -319,13 +389,6 @@ class PoseCoachApp:
             style="Primary.TButton",
         )
         self.btn_record_analyze.pack(pady=(0, 14), fill=tk.X, padx=14)
-        self.btn_play_analysis = ttk.Button(
-            record_section,
-            text="분석 결과 재생",
-            command=self._play_analysis_result,
-            state=tk.DISABLED,
-        )
-        self.btn_play_analysis.pack(pady=(0, 14), fill=tk.X, padx=14)
 
         # 유사도 표시
         score_section = section(left, "유사도")
@@ -350,16 +413,62 @@ class PoseCoachApp:
             font=("Malgun Gothic", 15, "bold"),
         ).pack(fill=tk.X, pady=(0, 8))
 
-        self.canvas = tk.Label(
+        self.video_area = tk.Frame(
             right,
             bg="#020617",
-            cursor="crosshair",
             highlightbackground=border,
             highlightthickness=1,
+        )
+        self.video_area.pack(fill=tk.BOTH, expand=True)
+        self.video_area.pack_propagate(False)
+        self.video_area.bind("<Configure>", self._on_video_area_resize)
+
+        self.canvas = tk.Label(
+            self.video_area,
+            bg="#020617",
+            cursor="crosshair",
         )
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.bind("<ButtonPress-1>", self._on_roi_start)
         self.canvas.bind("<ButtonRelease-1>", self._on_roi_end)
+
+        self.analysis_controls = tk.Frame(self.video_area, bg="#111827")
+        self.analysis_controls.place(relx=0.0, rely=1.0, relwidth=1.0, y=-2, anchor="sw")
+        self.btn_video_play = tk.Button(
+            self.analysis_controls,
+            text="▶",
+            command=self._play_video_from_controls,
+            state=tk.NORMAL,
+            bg="#111827",
+            fg="#f8fafc",
+            activebackground="#1f2937",
+            activeforeground="#f8fafc",
+            disabledforeground="#64748b",
+            bd=0,
+            padx=10,
+            pady=4,
+            font=("Malgun Gothic", 13, "bold"),
+            cursor="hand2",
+        )
+        self.btn_video_play.pack(side=tk.LEFT, padx=(12, 4), pady=(4, 8))
+        self.analysis_seek_bar = SeekBar(
+            self.analysis_controls,
+            command=self._seek_analysis,
+            bg="#111827",
+            track_bg="#64748b",
+            active_bg="#0ea5e9",
+            thumb_bg="#f8fafc",
+        )
+        self.analysis_seek_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 10), pady=(4, 8))
+        self.analysis_time_label = tk.Label(
+            self.analysis_controls,
+            text="0:00 / 0:00",
+            bg="#111827",
+            fg="#e5e7eb",
+            font=("Malgun Gothic", 9),
+            width=12,
+        )
+        self.analysis_time_label.pack(side=tk.LEFT, padx=(0, 12), pady=(4, 8))
 
         timeline = tk.Frame(
             right,
@@ -389,18 +498,19 @@ class PoseCoachApp:
             bg="#111827",
             fg=text,
             font=("Malgun Gothic", 10, "bold"),
-            width=18,
+            width=15,
         )
-        self.crop_label.pack(side=tk.LEFT, padx=10, pady=10)
+        self.crop_label.pack(side=tk.LEFT, padx=(8, 6), pady=10)
 
         ttk.Button(
             timeline,
             text="포즈 추출",
             command=self._extract_ref_poses,
             style="Primary.TButton",
-        ).pack(side=tk.LEFT, padx=(10, 6), pady=8)
-        ttk.Button(timeline, text="영역 초기화", command=self._reset_roi).pack(
-            side=tk.LEFT, padx=(0, 12), pady=8
+            width=9,
+        ).pack(side=tk.LEFT, padx=(0, 4), pady=8)
+        ttk.Button(timeline, text="영역 초기화", command=self._reset_roi, width=10).pack(
+            side=tk.LEFT, padx=(0, 8), pady=8
         )
 
         user_timeline = tk.Frame(
@@ -478,6 +588,7 @@ class PoseCoachApp:
             return
 
         total_sec = max(1, int(self.loader.duration))
+        self.playback_target = "reference"
         self.crop_start_var.set(0)
         self.crop_end_var.set(total_sec)
         self.range_slider.set_bounds(0, total_sec)
@@ -492,12 +603,17 @@ class PoseCoachApp:
             self._show_preview_frame(frame)
 
     def _on_slider_change(self, *_, update_preview: bool = True):
+        self.playback_target = "reference"
         s = self.crop_start_var.get()
         e = self.crop_end_var.get()
         if e <= s:
             self.crop_end_var.set(s + 1)
             e = s + 1
         self.crop_label.config(text=f"구간: {s}초 ~ {e}초")
+        if update_preview and self.analysis_playback_frames:
+            self.analysis_playback_frames = []
+            self._reset_analysis_playback()
+            self.btn_video_play.config(text="▶", state=tk.NORMAL)
         if update_preview:
             self._schedule_preview_update(s)
 
@@ -512,12 +628,96 @@ class PoseCoachApp:
 
     def _update_preview_at_second(self, second: int):
         self.preview_after_id = None
-        if self.loader.container is None or self.is_running or self.is_recording or self.is_playing_analysis:
+        if (
+            self.loader.container is None
+            or self.is_running
+            or self.is_recording
+            or self.is_playing_analysis
+            or self.is_playing_reference_preview
+        ):
             return
         f_idx = int(second * self.loader.fps)
         frame = self.loader.get_frame_at(f_idx)
         if frame is not None:
             self._show_preview_frame(frame)
+
+    def _play_selection_video(self, target: str):
+        if target == "user":
+            loader = self.user_loader
+            start_var = self.user_crop_start_var
+            end_var = self.user_crop_end_var
+            label = "녹화본"
+            crop = False
+        else:
+            loader = self.loader
+            start_var = self.crop_start_var
+            end_var = self.crop_end_var
+            label = "레퍼런스"
+            crop = True
+
+        if loader.container is None:
+            messagebox.showwarning(f"{label} 없음", f"먼저 {label} 영상을 준비하세요.")
+            return
+        if self.is_running or self.is_recording or self.is_playing_analysis:
+            messagebox.showwarning("실행 중", "현재 실행 중인 분석 또는 녹화를 중지하세요.")
+            return
+        if self.is_playing_reference_preview:
+            self.is_playing_reference_preview = False
+            self.btn_video_play.config(text="▶")
+            self.info_bar.config(text=f"{label} 구간 재생 중지")
+            return
+
+        start_sec = start_var.get()
+        end_sec = end_var.get()
+        if end_sec <= start_sec:
+            messagebox.showwarning("구간 오류", "끝 지점은 시작 지점보다 커야 합니다.")
+            return
+
+        self.is_playing_reference_preview = True
+        self._clear_frame_queue()
+        self.btn_video_play.config(text="■")
+        self.info_bar.config(text=f"{label} 선택 구간 재생 중 | {start_sec}초 ~ {end_sec}초")
+        threading.Thread(
+            target=self._play_selection_video_worker,
+            args=(loader, start_sec, end_sec, label, crop),
+            daemon=True,
+        ).start()
+        self._update_canvas()
+
+    def _play_selection_video_worker(
+        self,
+        loader: VideoLoader,
+        start_sec: int,
+        end_sec: int,
+        label: str,
+        crop: bool,
+    ):
+        start_f = int(start_sec * loader.fps)
+        end_f = int(end_sec * loader.fps)
+        frame_interval = 1.0 / max(loader.fps, 1.0)
+
+        for frame in loader.get_frame_range(start_f, end_f):
+            if not self.is_playing_reference_preview:
+                break
+            display = self._crop_frame_to_roi(frame) if crop else frame
+            cv2.putText(
+                display,
+                f"{label.upper()} {start_sec}s-{end_sec}s",
+                (16, 34),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (14, 165, 233),
+                2,
+            )
+            self._enqueue_frame(display)
+            time.sleep(frame_interval)
+
+        self.root.after(0, self._finish_reference_preview)
+
+    def _finish_reference_preview(self):
+        self.is_playing_reference_preview = False
+        self.btn_video_play.config(text="▶", state=tk.NORMAL)
+        self.info_bar.config(text="선택 구간 재생 완료")
 
     def _extract_ref_poses(self):
         """크롭된 구간에서 레퍼런스 포즈를 추출합니다."""
@@ -526,6 +726,9 @@ class PoseCoachApp:
             return
         if self.is_recording:
             messagebox.showwarning("녹화 중", "녹화를 종료한 뒤 레퍼런스 포즈를 추출하세요.")
+            return
+        if self.is_playing_reference_preview:
+            messagebox.showwarning("재생 중", "레퍼런스 구간 재생을 중지한 뒤 포즈를 추출하세요.")
             return
 
         start_f = int(self.crop_start_var.get() * self.loader.fps)
@@ -578,6 +781,9 @@ class PoseCoachApp:
         if self.is_recording:
             messagebox.showwarning("녹화 중", "녹화를 종료한 뒤 실시간 분석을 시작하세요.")
             return
+        if self.is_playing_reference_preview:
+            messagebox.showwarning("재생 중", "레퍼런스 구간 재생을 중지한 뒤 실시간 분석을 시작하세요.")
+            return
         self.is_running = True
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
@@ -593,6 +799,9 @@ class PoseCoachApp:
     def _start_recording(self):
         if self.is_running:
             messagebox.showwarning("실행 중", "실시간 분석을 중지한 뒤 녹화를 시작하세요.")
+            return
+        if self.is_playing_reference_preview:
+            messagebox.showwarning("재생 중", "레퍼런스 구간 재생을 중지한 뒤 녹화를 시작하세요.")
             return
         if self.loader.container is None:
             messagebox.showwarning("레퍼런스 없음", "먼저 유튜브 또는 레퍼런스 영상을 로드하세요.")
@@ -611,9 +820,11 @@ class PoseCoachApp:
         self.btn_record_start.config(state=tk.DISABLED)
         self.btn_record_stop.config(state=tk.NORMAL)
         self.btn_record_analyze.config(state=tk.DISABLED)
-        self.btn_play_analysis.config(state=tk.DISABLED)
+        self.btn_video_play.config(state=tk.DISABLED)
         self.analysis_playback_frames = []
-        self.info_bar.config(text="카메라 녹화 중입니다. 종료 버튼을 누르면 녹화본을 불러옵니다.")
+        self._reset_analysis_playback()
+        self._clear_frame_queue()
+        self.info_bar.config(text="카메라 준비 중...")
         threading.Thread(target=self._record_loop, args=(self.recorded_video_path,), daemon=True).start()
         self._update_canvas()
 
@@ -623,18 +834,32 @@ class PoseCoachApp:
         self.info_bar.config(text="녹화 종료 처리 중...")
 
     def _record_loop(self, output_path: str):
-        cap = cv2.VideoCapture(0)
+        cap = self._open_camera()
         if not cap.isOpened():
             self.is_recording = False
             self.root.after(0, messagebox.showerror, "카메라 오류", "카메라를 열 수 없습니다.")
             self.root.after(0, self._finish_recording, None)
             return
 
+        ret, first_frame = cap.read()
+        if not ret:
+            cap.release()
+            self.is_recording = False
+            self.root.after(0, messagebox.showerror, "카메라 오류", "카메라 프레임을 읽을 수 없습니다.")
+            self.root.after(0, self._finish_recording, None)
+            return
+
+        first_frame = cv2.flip(first_frame, 1)
+        self._enqueue_frame(self._decorate_recording_frame(first_frame.copy(), 0.0))
+        self.root.after(
+            0,
+            lambda: self.info_bar.config(text="카메라 녹화 중입니다. 종료 버튼을 누르면 녹화본을 불러옵니다."),
+        )
+
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         if fps <= 1:
             fps = 30.0
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+        height, width = first_frame.shape[:2]
         writer = cv2.VideoWriter(
             output_path,
             cv2.VideoWriter_fourcc(*"mp4v"),
@@ -649,6 +874,7 @@ class PoseCoachApp:
             return
 
         started_at = time.monotonic()
+        writer.write(first_frame)
 
         while self.is_recording:
             ret, frame = cap.read()
@@ -656,21 +882,49 @@ class PoseCoachApp:
                 break
             frame = cv2.flip(frame, 1)
             writer.write(frame)
-            display = frame.copy()
-            cv2.circle(display, (24, 24), 8, (0, 0, 255), -1)
-            cv2.putText(display, "REC", (40, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            ref_display = self._get_reference_display_for_elapsed(
-                time.monotonic() - started_at,
-                overlay_pose=bool(self.ref_frames and self.ref_poses),
-            )
-            if ref_display is not None:
-                display = self._compose_split_screen(display, ref_display)
-            if not self.frame_queue.full():
-                self.frame_queue.put(display)
+            display = self._decorate_recording_frame(frame.copy(), time.monotonic() - started_at)
+            self._enqueue_frame(display)
 
         writer.release()
         cap.release()
         self.root.after(0, self._finish_recording, output_path)
+
+    def _open_camera(self):
+        """Windows에서는 DirectShow가 기본 MSMF보다 첫 프레임 지연이 적은 경우가 많습니다."""
+        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, 0]
+        for backend in backends:
+            cap = cv2.VideoCapture(0, backend) if backend else cv2.VideoCapture(0)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                return cap
+            cap.release()
+        return cv2.VideoCapture(0)
+
+    def _decorate_recording_frame(self, frame: np.ndarray, elapsed: float) -> np.ndarray:
+        cv2.circle(frame, (24, 24), 8, (0, 0, 255), -1)
+        cv2.putText(frame, "REC", (40, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        ref_display = self._get_reference_display_for_elapsed(
+            elapsed,
+            overlay_pose=bool(self.ref_frames and self.ref_poses),
+        )
+        if ref_display is not None:
+            return self._compose_split_screen(frame, ref_display)
+        return frame
+
+    def _clear_frame_queue(self):
+        while not self.frame_queue.empty():
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _enqueue_frame(self, frame: np.ndarray):
+        if self.frame_queue.full():
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+        self.frame_queue.put(frame)
 
     def _get_reference_display_for_elapsed(self, elapsed: float, overlay_pose: bool = False):
         if self.ref_frames:
@@ -697,11 +951,13 @@ class PoseCoachApp:
         self.btn_record_stop.config(state=tk.DISABLED)
         if not output_path:
             self.info_bar.config(text="녹화에 실패했습니다.")
+            self.btn_video_play.config(text="▶", state=tk.NORMAL)
             return
 
         ok = self.user_loader.load_local(output_path)
         if not ok:
             self.info_bar.config(text="녹화본을 불러올 수 없습니다.")
+            self.btn_video_play.config(text="▶", state=tk.NORMAL)
             return
 
         total_sec = max(1, int(self.user_loader.duration))
@@ -714,9 +970,16 @@ class PoseCoachApp:
             text=f"녹화 완료 | {self.user_loader.width}×{self.user_loader.height} | "
                  f"{total_sec}초 | {self.user_loader.fps:.1f}fps"
         )
+        self.btn_video_play.config(text="▶", state=tk.NORMAL)
+        self.playback_target = "user"
         self._show_user_selected_start()
 
     def _on_user_slider_change(self, *_, update_preview: bool = True):
+        self.playback_target = "user"
+        if update_preview and self.analysis_playback_frames:
+            self.analysis_playback_frames = []
+            self._reset_analysis_playback()
+            self.btn_video_play.config(text="▶", state=tk.NORMAL)
         s = self.user_crop_start_var.get()
         e = self.user_crop_end_var.get()
         if e <= s:
@@ -747,7 +1010,48 @@ class PoseCoachApp:
         if self.user_loader.container is None:
             messagebox.showwarning("녹화 없음", "먼저 카메라 녹화를 완료하세요.")
             return
+        self.playback_target = "user"
         self._update_user_preview_at_second(self.user_crop_start_var.get())
+
+    def _reset_analysis_playback(self):
+        self.analysis_playhead_idx = 0
+        self.analysis_seek_bar.set_max(1)
+        self.analysis_seek_bar.set_value(0)
+        self._update_analysis_time_label()
+
+    def _set_analysis_playback_frames(self, frames: list[np.ndarray]):
+        self.analysis_playback_frames = frames
+        self.analysis_playhead_idx = 0
+        self.analysis_seek_bar.set_max(max(1, len(frames)))
+        self.analysis_seek_bar.set_value(0)
+        self._update_analysis_time_label()
+
+    def _seek_analysis(self, frame_idx: int):
+        if not self.analysis_playback_frames:
+            return
+        self.analysis_playhead_idx = max(0, min(frame_idx, len(self.analysis_playback_frames) - 1))
+        self.analysis_seek_bar.set_value(self.analysis_playhead_idx)
+        self._update_analysis_time_label()
+        if self.is_playing_analysis:
+            self.is_playing_analysis = False
+        if not (self.is_running or self.is_recording):
+            self._show_frame(self.analysis_playback_frames[self.analysis_playhead_idx].copy())
+
+    def _update_analysis_time_label(self):
+        total = len(self.analysis_playback_frames)
+        if total <= 0:
+            self.analysis_time_label.config(text="0:00 / 0:00")
+            return
+        fps = max(self.ref_playback_fps, 1.0)
+        self.analysis_time_label.config(
+            text=f"{self._format_seconds(self.analysis_playhead_idx / fps)} / "
+                 f"{self._format_seconds((total - 1) / fps)}"
+        )
+
+    @staticmethod
+    def _format_seconds(seconds: float) -> str:
+        seconds_int = max(0, int(round(seconds)))
+        return f"{seconds_int // 60}:{seconds_int % 60:02d}"
 
     def _analyze_recorded_video(self):
         if not self.ref_poses:
@@ -756,12 +1060,16 @@ class PoseCoachApp:
         if self.user_loader.container is None:
             messagebox.showwarning("녹화 없음", "먼저 카메라 녹화를 완료하세요.")
             return
+        if self.is_playing_analysis:
+            messagebox.showwarning("재생 중", "분석 결과 재생이 끝난 뒤 다시 분석하세요.")
+            return
 
         start_f = int(self.user_crop_start_var.get() * self.user_loader.fps)
         end_f = int(self.user_crop_end_var.get() * self.user_loader.fps)
         self.btn_record_analyze.config(state=tk.DISABLED)
-        self.btn_play_analysis.config(state=tk.DISABLED)
+        self.btn_video_play.config(state=tk.DISABLED)
         self.analysis_playback_frames = []
+        self._reset_analysis_playback()
         self.info_bar.config(text="녹화 구간 분석 중...")
         threading.Thread(
             target=self._analyze_recorded_video_worker,
@@ -789,16 +1097,27 @@ class PoseCoachApp:
         scores = []
         last_display = None
         playback_frames = []
-        pair_count = min(len(self.ref_poses), len(user_poses))
-        for idx in range(pair_count):
-            ref_idx = int(idx * len(self.ref_poses) / pair_count)
-            user_idx = int(idx * len(user_poses) / pair_count)
+        dtw_path, dtw_cost = self.similarity_calc.dtw_match(self.ref_poses, user_poses)
+        if not dtw_path:
+            self.root.after(0, self._finish_recorded_analysis, None, None, None, [])
+            return
+
+        for ref_idx, user_idx in dtw_path:
             sim = self.similarity_calc.compute(self.ref_poses[ref_idx], user_poses[user_idx])
             scores.append(sim["overall"])
             user_display = self.visualizer.draw_pose(
                 user_frames[user_idx].copy(), user_poses[user_idx], sim["keypoint_status"]
             )
             user_display = self.visualizer.draw_similarity_hud(user_display, sim)
+            cv2.putText(
+                user_display,
+                f"DTW cost: {dtw_cost:.3f}",
+                (10, 132),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (220, 220, 220),
+                1,
+            )
             ref_display = self.visualizer.draw_pose(
                 self.ref_frames[ref_idx].copy(), self.ref_poses[ref_idx]
             )
@@ -810,7 +1129,7 @@ class PoseCoachApp:
             0,
             self._finish_recorded_analysis,
             avg_score,
-            pair_count,
+            len(dtw_path),
             last_display,
             playback_frames,
         )
@@ -826,14 +1145,28 @@ class PoseCoachApp:
         if avg_score is None or pair_count is None:
             messagebox.showwarning("감지 실패", "녹화 구간에서 포즈를 감지하지 못했습니다.")
             self.info_bar.config(text="녹화 구간 포즈 감지 실패")
+            self.btn_video_play.config(text="▶", state=tk.NORMAL)
             return
-        self.analysis_playback_frames = playback_frames
+        self._set_analysis_playback_frames(playback_frames)
         if self.analysis_playback_frames:
-            self.btn_play_analysis.config(state=tk.NORMAL)
+            self.playback_target = "analysis"
+            self.btn_video_play.config(state=tk.NORMAL)
         self._update_sim_ui(avg_score)
         self.info_bar.config(text=f"녹화 구간 분석 완료 | 비교 프레임 {pair_count}개 | 평균 유사도 {avg_score*100:.1f}%")
         if display_frame is not None:
             self._show_frame(display_frame)
+
+    def _play_video_from_controls(self):
+        if self.is_playing_reference_preview:
+            self._play_selection_video(self.playback_target)
+            return
+        if self.playback_target == "analysis" and self.analysis_playback_frames:
+            self._play_analysis_result()
+            return
+        if self.playback_target == "user":
+            self._play_selection_video("user")
+            return
+        self._play_selection_video("reference")
 
     def _play_analysis_result(self):
         if not self.analysis_playback_frames:
@@ -845,26 +1178,52 @@ class PoseCoachApp:
         if self.is_playing_analysis:
             return
 
+        start_idx = max(0, min(self.analysis_playhead_idx, len(self.analysis_playback_frames) - 1))
+
         self.is_playing_analysis = True
-        self.btn_play_analysis.config(state=tk.DISABLED)
-        self.info_bar.config(text="분석 결과 재생 중...")
-        threading.Thread(target=self._play_analysis_result_worker, daemon=True).start()
+        self._clear_frame_queue()
+        self.btn_record_analyze.config(state=tk.DISABLED)
+        self.btn_video_play.config(text="■", state=tk.DISABLED)
+        self.info_bar.config(text="분석 결과 영상 재생 중...")
+        threading.Thread(
+            target=self._play_analysis_result_worker,
+            args=(start_idx,),
+            daemon=True,
+        ).start()
         self._update_canvas()
 
-    def _play_analysis_result_worker(self):
+    def _play_analysis_result_worker(self, start_idx: int):
         interval = 1.0 / max(self.ref_playback_fps, 1.0)
-        for frame in self.analysis_playback_frames:
+        total = len(self.analysis_playback_frames)
+        for frame_idx in range(start_idx, total):
             if not self.is_playing_analysis:
                 break
-            if not self.frame_queue.full():
-                self.frame_queue.put(frame.copy())
+            display = self.analysis_playback_frames[frame_idx].copy()
+            cv2.putText(
+                display,
+                f"PLAY {frame_idx + 1}/{total}",
+                (16, display.shape[0] - 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+            )
+            self.analysis_playhead_idx = frame_idx
+            self.root.after(0, self._sync_analysis_seek_ui, frame_idx)
+            self._enqueue_frame(display)
             time.sleep(interval)
         self.root.after(0, self._finish_analysis_playback)
 
+    def _sync_analysis_seek_ui(self, frame_idx: int):
+        self.analysis_playhead_idx = max(0, min(frame_idx, len(self.analysis_playback_frames) - 1))
+        self.analysis_seek_bar.set_value(self.analysis_playhead_idx)
+        self._update_analysis_time_label()
+
     def _finish_analysis_playback(self):
         self.is_playing_analysis = False
-        self.btn_play_analysis.config(state=tk.NORMAL)
-        self.info_bar.config(text="분석 결과 재생 완료")
+        self.btn_record_analyze.config(state=tk.NORMAL)
+        self.btn_video_play.config(text="▶", state=tk.NORMAL)
+        self.info_bar.config(text="분석 결과 영상 재생 완료")
 
     # ── 실시간 카메라 루프 (별도 스레드) ──────────────────────
 
@@ -980,27 +1339,38 @@ class PoseCoachApp:
 
     # ── UI 업데이트 ───────────────────────────────────────
 
+    def _on_video_area_resize(self, event):
+        self.video_area_size = (max(1, event.width), max(1, event.height))
+
     def _update_canvas(self):
         """Tkinter 메인 루프에서 주기적으로 캔버스 갱신."""
         if not self.frame_queue.empty():
             frame = self.frame_queue.get()
             self._show_frame(frame)
-        if self.is_running or self.is_recording or self.is_playing_analysis:
+        if self.is_running or self.is_recording or self.is_playing_analysis or self.is_playing_reference_preview:
             self.root.after(30, self._update_canvas)
 
     def _show_frame(self, frame: np.ndarray):
         """OpenCV BGR 프레임을 Tkinter 캔버스에 표시."""
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
+        cw, ch = self.video_area_size
+        cw = self.video_area.winfo_width() or cw or 960
+        ch = self.video_area.winfo_height() or ch or 540
 
-        # 캔버스 크기에 맞게 리사이즈
-        cw = self.canvas.winfo_width() or 960
-        ch = self.canvas.winfo_height() or 720
-        img.thumbnail((cw, ch), Image.LANCZOS)
-        self.display_size = img.size
-        self.display_origin = ((cw - img.size[0]) // 2, (ch - img.size[1]) // 2)
+        h, w = frame.shape[:2]
+        scale = min(cw / max(w, 1), ch / max(h, 1))
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-        photo = ImageTk.PhotoImage(img)
+        canvas_frame = np.zeros((ch, cw, 3), dtype=np.uint8)
+        x = (cw - new_w) // 2
+        y = (ch - new_h) // 2
+        canvas_frame[y:y + new_h, x:x + new_w] = resized
+        self.display_size = (new_w, new_h)
+        self.display_origin = (x, y)
+
+        rgb = cv2.cvtColor(canvas_frame, cv2.COLOR_BGR2RGB)
+        photo = ImageTk.PhotoImage(Image.fromarray(rgb))
         self.canvas.config(image=photo)
         self.canvas.image = photo  # 참조 유지
 

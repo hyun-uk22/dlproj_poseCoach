@@ -9,6 +9,7 @@ GOOD_POSE_THRESHOLD = 0.80
 KEYPOINT_ANGLE_TOLERANCE = 25.0  # 25도 이내면 해당 관절 OK
 KEYPOINT_DISTANCE_TOLERANCE = 0.75
 MIN_PROCRUSTES_KEYPOINTS = 5
+DTW_WINDOW_RATIO = 0.35
 
 MIRROR_KEYPOINT_NAMES = {
     "nose": "nose",
@@ -38,6 +39,56 @@ class SimilarityCalculator:
     """
     레퍼런스 포즈(영상)와 사용자 포즈(카메라) 간의 유사도를 계산합니다.
     """
+
+    def dtw_match(self, ref_poses: list[dict], user_poses: list[dict]) -> tuple[list[tuple[int, int]], float]:
+        """
+        레퍼런스와 사용자 pose sequence를 DTW로 정렬합니다.
+
+        반환:
+          path: [(ref_idx, user_idx), ...]
+          normalized_cost: path 길이로 나눈 평균 feature 거리
+        """
+        if not ref_poses or not user_poses:
+            return [], float("inf")
+
+        n = len(ref_poses)
+        m = len(user_poses)
+        window = max(abs(n - m), int(max(n, m) * DTW_WINDOW_RATIO), 1)
+
+        ref_features = [self._pose_feature(pose, mirror=False) for pose in ref_poses]
+        user_features = [self._pose_feature(pose, mirror=False) for pose in user_poses]
+        user_mirror_features = [self._pose_feature(pose, mirror=True) for pose in user_poses]
+
+        cost = np.full((n + 1, m + 1), np.inf, dtype=np.float64)
+        cost[0, 0] = 0.0
+
+        for i in range(1, n + 1):
+            center_j = int(round(i * m / n))
+            j_start = max(1, center_j - window)
+            j_end = min(m, center_j + window)
+            for j in range(j_start, j_end + 1):
+                dist = min(
+                    self._feature_distance(ref_features[i - 1], user_features[j - 1]),
+                    self._feature_distance(ref_features[i - 1], user_mirror_features[j - 1]),
+                )
+                cost[i, j] = dist + min(cost[i - 1, j], cost[i, j - 1], cost[i - 1, j - 1])
+
+        if not np.isfinite(cost[n, m]):
+            return self._linear_match(n, m), float("inf")
+
+        path = []
+        i, j = n, m
+        while i > 0 and j > 0:
+            path.append((i - 1, j - 1))
+            candidates = (
+                (cost[i - 1, j - 1], i - 1, j - 1),
+                (cost[i - 1, j], i - 1, j),
+                (cost[i, j - 1], i, j - 1),
+            )
+            _, i, j = min(candidates, key=lambda item: item[0])
+
+        path.reverse()
+        return path, float(cost[n, m] / max(len(path), 1))
 
     def compute(
         self,
@@ -164,6 +215,49 @@ class SimilarityCalculator:
             keypoint_errors[KEYPOINT_NAMES[display_idx]] = float(dist)
 
         return float(np.mean(sims)), keypoint_errors
+
+    def _pose_feature(self, pose: dict, mirror: bool) -> np.ndarray:
+        keypoints = pose.get("normalized_keypoints", pose["keypoints"]).copy()
+        valid = pose.get("valid")
+        if valid is None:
+            valid = np.ones(len(keypoints), dtype=bool)
+
+        if mirror:
+            keypoints = self._mirror_keypoints(keypoints)
+            valid = valid[MIRROR_KEYPOINT_INDICES]
+
+        keypoints = keypoints.copy()
+        keypoints[~valid] = 0.0
+
+        angle_values = []
+        angles = pose.get("angles", {})
+        for name in KEYPOINT_NAMES:
+            angle_name = MIRROR_KEYPOINT_NAMES[name] if mirror else name
+            angle_values.append(float(angles.get(angle_name, 0.0)) / 180.0)
+
+        valid_values = valid.astype(np.float64)
+        return np.concatenate(
+            [
+                keypoints.reshape(-1).astype(np.float64),
+                np.asarray(angle_values, dtype=np.float64),
+                valid_values,
+            ]
+        )
+
+    @staticmethod
+    def _feature_distance(ref_feature: np.ndarray, user_feature: np.ndarray) -> float:
+        diff = ref_feature - user_feature
+        return float(np.linalg.norm(diff) / max(np.sqrt(diff.size), 1.0))
+
+    @staticmethod
+    def _linear_match(n: int, m: int) -> list[tuple[int, int]]:
+        pair_count = min(n, m)
+        if pair_count <= 0:
+            return []
+        return [
+            (int(idx * n / pair_count), int(idx * m / pair_count))
+            for idx in range(pair_count)
+        ]
 
     @staticmethod
     def _mirror_keypoints(keypoints: np.ndarray) -> np.ndarray:

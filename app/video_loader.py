@@ -49,6 +49,7 @@ class VideoLoader:
                 "best[height<=720]/best"
             ),
             "js_runtimes": self._get_js_runtimes(),
+            "remote_components": ["ejs:github"],
             "quiet": True,
             "noplaylist": True,
         }
@@ -212,5 +213,5 @@ class VideoLoader:
 
     @staticmethod
     def is_youtube_url(text: str) -> bool:
-        pattern = r"(youtube\.com/watch|youtu\.be/)"
+        pattern = r"(https?://)?(www\.|m\.)?(youtube\.com/(watch\?|shorts/|embed/)|youtu\.be/)"
         return bool(re.search(pattern, text))
